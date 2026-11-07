@@ -202,7 +202,7 @@ chainlog::Verdict verify_dir(const std::string& dir) {
   return v;
 }
 
-void reseal_all_checkpoints(const std::string& dir) {
+void reseal_all_checkpoints(const std::string& dir, const std::string& key) {
   const std::string log_bytes = read_file(chainlog::Log::log_path(dir));
 
   chainlog::Header h;
@@ -228,11 +228,46 @@ void reseal_all_checkpoints(const std::string& dir) {
       c.first_index = records[i].index + 1 - bs;
       c.last_index = records[i].index;
       c.root = chainlog::merkle_root(block);
+      if (!key.empty()) {
+        chainlog::sign_checkpoint(key, &c);
+      }
       chainlog::append_checkpoint_frame(c, &out);
       block.clear();
     }
   }
   write_file(chainlog::Log::checkpoints_path(dir), out);
+}
+
+void strip_checkpoint_signatures(const std::string& dir) {
+  const std::string path = chainlog::Log::checkpoints_path(dir);
+  const std::string bytes = read_file(path);
+
+  chainlog::CheckpointHeader ch;
+  std::string detail;
+  if (chainlog::decode_checkpoint_header(bytes.data(), bytes.size(), &ch,
+                                         &detail) != chainlog::Problem::kOk) {
+    die("strip_checkpoint_signatures: bad header: " + detail);
+  }
+
+  std::string out;
+  chainlog::encode_checkpoint_header(ch, &out);
+
+  size_t off = chainlog::kCheckpointHeaderBytes;
+  while (off < bytes.size()) {
+    chainlog::Checkpoint c;
+    size_t consumed = 0;
+    if (chainlog::decode_checkpoint_frame(bytes.data() + off,
+                                          bytes.size() - off, &c, &consumed,
+                                          &detail) !=
+        chainlog::Problem::kOk) {
+      die("strip_checkpoint_signatures: bad frame: " + detail);
+    }
+    c.flags = 0;  // drop the signed bit; the HMAC goes with it
+    c.hmac = chainlog::Digest();
+    chainlog::append_checkpoint_frame(c, &out);
+    off += consumed;
+  }
+  write_file(path, out);
 }
 
 }  // namespace chainlog_test

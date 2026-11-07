@@ -69,7 +69,15 @@ chainlog::Verdict verify_dir(const std::string& dir);
 // Rewrites the checkpoints file from scratch so that every root matches the
 // records currently on disk -- what a thorough attacker would do after
 // re-linking the log. Used to show the last rung of the ladder.
-void reseal_all_checkpoints(const std::string& dir);
+//
+// `key` empty writes unsigned checkpoints (an attacker without the key);
+// non-empty signs them (an attacker who also has the key).
+void reseal_all_checkpoints(const std::string& dir,
+                            const std::string& key = std::string());
+
+// Strips the HMAC from every checkpoint, leaving valid unsigned ones: the
+// downgrade an attacker would attempt against a signed log.
+void strip_checkpoint_signatures(const std::string& dir);
 
 }  // namespace chainlog_test
 

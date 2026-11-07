@@ -28,13 +28,14 @@ TST_DIR = $(BUILD)/test
 # Engine sources, shared by the release and test builds.
 LIB_SRCS  = src/sha256.cpp src/hex.cpp src/crc32.cpp src/fileio.cpp \
             src/record.cpp src/merkle.cpp src/checkpoint.cpp \
-            src/wal.cpp src/faultinject.cpp src/log.cpp
+            src/wal.cpp src/hmac.cpp src/faultinject.cpp src/log.cpp
 TEST_SRCS = tests/test.cpp tests/test_sha256.cpp tests/test_crc32.cpp \
-            tests/test_record.cpp tests/test_merkle.cpp tests/test_log.cpp \
-            tests/test_checkpoint.cpp tests/test_wal.cpp \
+            tests/test_record.cpp tests/test_merkle.cpp tests/test_hmac.cpp \
+            tests/test_log.cpp \
+            tests/test_checkpoint.cpp tests/test_wal.cpp tests/test_anchor.cpp \
             tests/log_fixture.cpp
 CLI_SRCS  = src/main.cpp
-TOOL_SRCS = tools/cl_sha256.cpp tools/cl_crc32.cpp
+TOOL_SRCS = tools/cl_sha256.cpp tools/cl_crc32.cpp tools/cl_hmac.cpp
 
 REL_LIB_OBJS  = $(LIB_SRCS:%.cpp=$(REL_DIR)/%.o)
 REL_CLI_OBJS  = $(CLI_SRCS:%.cpp=$(REL_DIR)/%.o)
@@ -44,6 +45,7 @@ TST_OBJS      = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(TEST_SRCS:%.cpp=$(TST_DIR)/%.
 CHAINLOG  = $(REL_DIR)/chainlog
 CL_SHA256 = $(REL_DIR)/cl-sha256
 CL_CRC32  = $(REL_DIR)/cl-crc32
+CL_HMAC   = $(REL_DIR)/cl-hmac
 TESTBIN   = $(TST_DIR)/chainlog-tests
 
 # The sanitized build of the CLI: the shell tests drive this one, so that
@@ -52,7 +54,7 @@ TST_CLI_OBJS = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(CLI_SRCS:%.cpp=$(TST_DIR)/%.o)
 CHAINLOG_ASAN = $(TST_DIR)/chainlog
 
 .PHONY: all test unit oracle cli crash clean
-all: $(CHAINLOG) $(CL_SHA256) $(CL_CRC32)
+all: $(CHAINLOG) $(CL_SHA256) $(CL_CRC32) $(CL_HMAC)
 
 # --- compile rules ---------------------------------------------------------
 # One pattern rule per build flavour; -MMD -MP emits header dependencies so
@@ -84,6 +86,10 @@ $(CL_CRC32): $(REL_LIB_OBJS) $(REL_DIR)/tools/cl_crc32.o
 	@mkdir -p $(dir $@)
 	$(CXX) $(REL_FLAGS) $(REL_LIB_OBJS) $(REL_DIR)/tools/cl_crc32.o -o $@
 
+$(CL_HMAC): $(REL_LIB_OBJS) $(REL_DIR)/tools/cl_hmac.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(REL_FLAGS) $(REL_LIB_OBJS) $(REL_DIR)/tools/cl_hmac.o -o $@
+
 $(TESTBIN): $(TST_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(TST_FLAGS) $(TST_OBJS) -o $@
@@ -95,9 +101,10 @@ $(TESTBIN): $(TST_OBJS)
 unit: $(TESTBIN)
 	$(TESTBIN)
 
-oracle: $(CL_SHA256) $(CL_CRC32) $(CHAINLOG)
+oracle: $(CL_SHA256) $(CL_CRC32) $(CL_HMAC) $(CHAINLOG)
 	tests/oracle_sha256.sh $(CL_SHA256)
 	tests/oracle_crc32.sh $(CL_CRC32)
+	tests/oracle_hmac.sh $(CL_HMAC)
 	tests/oracle_format.sh $(CHAINLOG)
 
 # End-to-end CLI checks, run against the sanitized binary.

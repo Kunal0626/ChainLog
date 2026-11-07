@@ -4,13 +4,42 @@
 #include <cstring>
 
 #include "crc32.h"
+#include "hmac.h"
 
 namespace chainlog {
 namespace {
 
 const char kMagic[8] = {'C', 'H', 'L', 'G', 'C', 'K', 'P', 'T'};
 
+// The 52 bytes an HMAC is computed over, and the first 52 bytes of every
+// payload on disk. One function so the signer and the verifier cannot
+// disagree about what is being signed.
+void encode_unsigned_payload(const Checkpoint& c, uint8_t out[52]) {
+  put_u32_le(out, c.flags);
+  put_u64_le(out + 4, c.first_index);
+  put_u64_le(out + 12, c.last_index);
+  std::memcpy(out + 20, c.root.data(), c.root.size());
+}
+
 }  // namespace
+
+void sign_checkpoint(const std::string& key, Checkpoint* c) {
+  c->flags |= kCheckpointFlagSigned;
+  uint8_t payload[kCheckpointPayloadBytes];
+  encode_unsigned_payload(*c, payload);
+  c->hmac = hmac_sha256(key.data(), key.size(), payload, sizeof(payload));
+}
+
+bool checkpoint_signature_valid(const std::string& key, const Checkpoint& c) {
+  if (!c.is_signed()) {
+    return false;
+  }
+  uint8_t payload[kCheckpointPayloadBytes];
+  encode_unsigned_payload(c, payload);
+  const Digest expected =
+      hmac_sha256(key.data(), key.size(), payload, sizeof(payload));
+  return digests_equal_constant_time(expected, c.hmac);
+}
 
 void encode_checkpoint_header(const CheckpointHeader& h, std::string* out) {
   uint8_t buf[kCheckpointHeaderBytes];
@@ -80,20 +109,23 @@ Problem decode_checkpoint_header(const void* buf, size_t len,
 }
 
 void append_checkpoint_frame(const Checkpoint& c, std::string* out) {
-  uint8_t payload[kCheckpointPayloadBytes];
-  put_u32_le(payload, c.flags);
-  put_u64_le(payload + 4, c.first_index);
-  put_u64_le(payload + 12, c.last_index);
-  std::memcpy(payload + 20, c.root.data(), c.root.size());
+  uint8_t payload[kCheckpointSignedPayloadBytes];
+  encode_unsigned_payload(c, payload);
+  size_t payload_len = kCheckpointPayloadBytes;
+  if (c.is_signed()) {
+    std::memcpy(payload + kCheckpointPayloadBytes, c.hmac.data(),
+                c.hmac.size());
+    payload_len = kCheckpointSignedPayloadBytes;
+  }
 
   uint8_t frame_head[8];
   put_u32_le(frame_head, kCheckpointMagic);
-  put_u32_le(frame_head + 4, static_cast<uint32_t>(sizeof(payload)));
+  put_u32_le(frame_head + 4, static_cast<uint32_t>(payload_len));
   out->append(reinterpret_cast<const char*>(frame_head), sizeof(frame_head));
-  out->append(reinterpret_cast<const char*>(payload), sizeof(payload));
+  out->append(reinterpret_cast<const char*>(payload), payload_len);
 
   uint8_t crc[4];
-  put_u32_le(crc, crc32(payload, sizeof(payload)));
+  put_u32_le(crc, crc32(payload, payload_len));
   out->append(reinterpret_cast<const char*>(crc), sizeof(crc));
 }
 
@@ -115,12 +147,14 @@ Problem decode_checkpoint_frame(const void* buf, size_t len, Checkpoint* out,
   }
 
   const uint32_t payload_len = get_u32_le(p + 4);
-  // The payload is fixed-size in version 1, so anything else is wrong. Phase
-  // 5's signed mode will accept 52 + 32 as well, keyed off the flags word.
-  if (payload_len != kCheckpointPayloadBytes) {
+  // Exactly two sizes are legal: unsigned, and signed with an HMAC appended.
+  if (payload_len != kCheckpointPayloadBytes &&
+      payload_len != kCheckpointSignedPayloadBytes) {
     if (detail != nullptr) {
       *detail = "checkpoint payload length " + std::to_string(payload_len) +
-                ", expected " + std::to_string(kCheckpointPayloadBytes);
+                ", expected " + std::to_string(kCheckpointPayloadBytes) +
+                " (unsigned) or " +
+                std::to_string(kCheckpointSignedPayloadBytes) + " (signed)";
     }
     return Problem::kBadCheckpoint;
   }
@@ -154,11 +188,27 @@ Problem decode_checkpoint_frame(const void* buf, size_t len, Checkpoint* out,
   c.last_index = get_u64_le(payload + 12);
   std::memcpy(c.root.data(), payload + 20, 32);
 
-  if (c.flags != 0) {
+  if ((c.flags & ~kCheckpointFlagSigned) != 0) {
     if (detail != nullptr) {
       *detail = "unknown checkpoint flags: " + std::to_string(c.flags);
     }
     return Problem::kBadCheckpoint;
+  }
+  // The flag and the length have to agree. Letting them disagree would mean a
+  // 52-byte payload could claim to be signed (with no MAC to check) or an
+  // 84-byte one could hide 32 bytes nothing looks at.
+  const bool claims_signed = c.is_signed();
+  const bool has_mac = (payload_len == kCheckpointSignedPayloadBytes);
+  if (claims_signed != has_mac) {
+    if (detail != nullptr) {
+      *detail = claims_signed
+                    ? "checkpoint is flagged signed but carries no HMAC"
+                    : "checkpoint carries an HMAC but is not flagged signed";
+    }
+    return Problem::kBadCheckpoint;
+  }
+  if (has_mac) {
+    std::memcpy(c.hmac.data(), payload + kCheckpointPayloadBytes, 32);
   }
   if (c.last_index < c.first_index) {
     if (detail != nullptr) {

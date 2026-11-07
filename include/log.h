@@ -27,6 +27,16 @@ class Log {
     // an existing one the value in the file header wins, because the stored
     // checkpoints are only meaningful relative to it.
     uint64_t block_size = kDefaultBlockSize;
+
+    // HMAC key for signing checkpoints. Empty means unsigned.
+    //
+    // When set, newly sealed checkpoints are signed, and verify() REQUIRES
+    // every checkpoint to be signed and valid. The requirement belongs here
+    // rather than in the file: an attacker with write access can always
+    // rewrite a checkpoint as unsigned, so only a verifier that insists on a
+    // signature catches that. Which also means the key must live outside the
+    // log directory -- if it does not, signing buys nothing.
+    std::string key;
   };
 
   struct Stats {
@@ -40,6 +50,22 @@ class Log {
     bool wal_pending = false;      // a record is staged but not applied
     bool read_only = false;        // opened without write access
     bool locked = false;           // holding the flock
+  };
+
+  // A head value published somewhere the attacker cannot reach: "record i
+  // hashed to h". Checking one closes both of the holes a hash chain has on
+  // its own, and they are different holes:
+  //
+  //   truncation -- a prefix of a valid chain is a valid chain, so cutting
+  //     records off the end is invisible from inside the file. An anchor for
+  //     an index past the new end has nothing to match.
+  //
+  //   wholesale rewriting -- an attacker who re-links every record and
+  //     re-seals every checkpoint leaves a directory that agrees with itself.
+  //     An anchor disagrees with it.
+  struct Anchor {
+    uint64_t index = 0;
+    Digest hash{};
   };
 
   // Why `prove` could not produce a proof, when it could not.
@@ -107,7 +133,15 @@ class Log {
   // only for I/O failures; a tampered log is a Verdict, not an error -- a
   // verifier that returned "error" for a detected forgery would be conflating
   // "I could not check" with "I checked, and it is bad".
-  bool verify(Verdict* out, std::string* err) const;
+  bool verify(Verdict* out, std::string* err) const {
+    return verify(std::vector<Anchor>(), out, err);
+  }
+
+  // As above, and additionally checks every anchor. Anchors are checked after
+  // the chain and the checkpoints, because an anchor failure on a log that is
+  // already internally broken is the less useful of the two findings.
+  bool verify(const std::vector<Anchor>& anchors, Verdict* out,
+              std::string* err) const;
 
   // Copies the last record into *out. Returns false if the log is empty.
   // O(1): the tail record is cached by open() and append().
@@ -120,17 +154,32 @@ class Log {
   // Reads the checkpoints file. *v is a verdict on that file alone; it is
   // non-ok if the file is damaged, in which case *out holds the checkpoints
   // read before the problem.
+  // `end_offset`, when given, receives the byte offset just past the last
+  // intact checkpoint. Signed and unsigned frames are different sizes, so
+  // that offset cannot be computed by arithmetic any more.
   bool read_checkpoints(std::vector<Checkpoint>* out, Verdict* v,
-                        std::string* err) const;
+                        std::string* err,
+                        uint64_t* end_offset = nullptr) const;
 
   // Builds an inclusion proof for the record at `index` against its block's
   // checkpoint root. Returns false only for I/O failures.
   bool prove(uint64_t index, ProveResult* out, std::string* err) const;
 
+  // Rewrites the checkpoints file with every checkpoint signed by the key
+  // this log was opened with. Used by `chainlog sign` to add signatures to a
+  // log that was not created with a key.
+  //
+  // Replaces the file atomically via rename(2), so a crash leaves either the
+  // old file or the new one and never a half-written mixture. The roots
+  // themselves are not recomputed: signing re-authenticates what is already
+  // there, it does not re-derive it, so it cannot launder a tampered log.
+  bool resign_checkpoints(std::string* err);
+
   uint64_t block_size() const { return header_.block_size; }
   uint64_t record_count() const { return record_count_; }
   uint64_t checkpoint_count() const { return checkpoint_count_; }
   bool read_only() const { return read_only_; }
+  bool signing() const { return !key_.empty(); }
   bool locked() const { return locked_; }
 
   // True when a record is staged in the WAL and has not been applied. After
@@ -182,6 +231,7 @@ class Log {
   Fd lock_fd_;
   Header header_;
 
+  std::string key_;
   bool read_only_ = false;
   bool locked_ = false;
   bool wal_pending_ = false;
@@ -209,6 +259,13 @@ class Log {
 
   Verdict scan_verdict_;
 };
+
+// Parses an anchor written as "index:hash" -- a decimal record index, a
+// colon, and 64 hex characters. This is exactly the form `chainlog anchor`
+// prints, so an anchor can be copied from one machine to another without
+// reformatting.
+bool parse_anchor(const std::string& text, Log::Anchor* out,
+                  std::string* detail);
 
 }  // namespace chainlog
 

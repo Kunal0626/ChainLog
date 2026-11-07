@@ -352,6 +352,209 @@ expect_exit 2 "a bad --prev-hash is a usage error" \
   --prev-hash "nothex"
 expect_exit 2 "an unknown option is a usage error" --dir "$D" --wat verify
 
+# --- anchoring -------------------------------------------------------------
+
+D="$TMP/anchored"
+i=0
+while [ "$i" -lt 12 ]; do
+  "$CLI" --dir "$D" --block-size 4 append "rec-$i" >/dev/null
+  i=$((i + 1))
+done
+
+expect_stdout_match "^11:$HEX64$" "anchor prints index:hash" --dir "$D" anchor
+
+# The output of `anchor` must be accepted verbatim by --anchor. That round
+# trip is the whole point of having a separate command rather than making the
+# operator reformat `head`.
+checks=$((checks + 1))
+ANCHOR="$("$CLI" --dir "$D" anchor)"
+if ! "$CLI" --dir "$D" verify --anchor "$ANCHOR" >/dev/null 2>&1; then
+  fail "the output of \`anchor\` was not accepted by --anchor"
+fi
+expect_stdout_match "^anchors_checked=1$" "verify says what it checked" \
+  --dir "$D" verify --anchor "$ANCHOR"
+expect_stdout_match "^signatures_required=0$" "and that no key was in use" \
+  --dir "$D" verify --anchor "$ANCHOR"
+
+# Several anchors at once.
+checks=$((checks + 1))
+A3="3:$("$CLI" --dir "$D" prove 3 | sed -n 's/^record_hash=//p')"
+if ! "$CLI" --dir "$D" verify --anchor "$ANCHOR" --anchor "$A3" \
+     >/dev/null 2>&1; then
+  fail "two correct anchors were not accepted"
+fi
+expect_stdout_match "^anchors_checked=2$" "both anchors counted" \
+  --dir "$D" verify --anchor "$ANCHOR" --anchor "$A3"
+
+# A wrong hash is a finding, not a usage error.
+ZEROHASH="0000000000000000000000000000000000000000000000000000000000000000"
+expect_exit 1 "a wrong anchor hash exits 1" \
+  --dir "$D" verify --anchor "11:$ZEROHASH"
+expect_stderr_match "anchor-mismatch" "and is named anchor-mismatch" \
+  --dir "$D" verify --anchor "11:$ZEROHASH"
+
+# An index past the end is the truncation signal.
+expect_exit 1 "an anchor past the end exits 1" \
+  --dir "$D" verify --anchor "99:$ZEROHASH"
+expect_stderr_match "anchor-missing" "and is named anchor-missing" \
+  --dir "$D" verify --anchor "99:$ZEROHASH"
+expect_stderr_match "shorter than this anchor" "and explains what it means" \
+  --dir "$D" verify --anchor "99:$ZEROHASH"
+
+# Malformed anchors are usage errors, caught before the log is read.
+expect_exit 2 "an anchor with no colon is a usage error" \
+  --dir "$D" verify --anchor "$ZEROHASH"
+expect_exit 2 "an anchor with a short hash is a usage error" \
+  --dir "$D" verify --anchor "5:abcd"
+expect_exit 2 "an anchor with a bad index is a usage error" \
+  --dir "$D" verify --anchor "x:$ZEROHASH"
+expect_stderr_match "index:hash" "and says what the form is" \
+  --dir "$D" verify --anchor "nonsense"
+expect_exit 2 "--anchor on a command other than verify is a usage error" \
+  --dir "$D" --anchor "11:$ZEROHASH" head
+
+# TRUNCATION, end to end: cut the log at a frame boundary. The chain alone
+# cannot see it; the anchor can.
+D2="$TMP/truncated"
+i=0
+while [ "$i" -lt 12 ]; do
+  # Fixed-width data, so every frame is the same length and the byte
+  # arithmetic below is exact. "rec-$i" would be 5 bytes for single digits and
+  # 6 for double, which silently breaks the offsets.
+  "$CLI" --dir "$D2" --block-size 4 append "$(printf 'rec-%02d' "$i")" \
+    >/dev/null
+  i=$((i + 1))
+done
+OLD_ANCHOR="$("$CLI" --dir "$D2" anchor)"
+FRAME=$((88 + 6 + 12))
+dd if="$D2/log" of="$TMP/t.log" bs=1 count=$((32 + 8 * FRAME)) status=none
+mv "$TMP/t.log" "$D2/log"
+CKPT_FRAME=$((12 + 52))
+dd if="$D2/checkpoints" of="$TMP/t.ckpt" bs=1 \
+  count=$((32 + 2 * CKPT_FRAME)) status=none
+mv "$TMP/t.ckpt" "$D2/checkpoints"
+
+expect_exit 0 "a truncated log still verifies on its own" --dir "$D2" verify
+expect_exit 1 "but not against the anchor taken before" \
+  --dir "$D2" verify --anchor "$OLD_ANCHOR"
+
+# --- an empty log has nothing to anchor ------------------------------------
+
+expect_exit 2 "anchor on an empty log is a usage error" \
+  --dir "$TMP/emptyanchor" anchor
+expect_stderr_match "nothing to anchor" "and says why" \
+  --dir "$TMP/emptyanchor" anchor
+
+# --- signed checkpoints ----------------------------------------------------
+
+KEY="$TMP/chainlog.key"
+printf '%s' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  >"$KEY"
+chmod 600 "$KEY"
+OTHERKEY="$TMP/other.key"
+printf '%s' "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100" \
+  >"$OTHERKEY"
+chmod 600 "$OTHERKEY"
+
+D3="$TMP/signed"
+i=0
+while [ "$i" -lt 12 ]; do
+  "$CLI" --dir "$D3" --block-size 4 --key-file "$KEY" append "rec-$i" \
+    >/dev/null
+  i=$((i + 1))
+done
+expect_exit 0 "a signed log verifies with its key" \
+  --dir "$D3" --key-file "$KEY" verify
+expect_stdout_match "^signatures_required=1$" "verify says the key was used" \
+  --dir "$D3" --key-file "$KEY" verify
+expect_exit 0 "a signed log also verifies without a key" --dir "$D3" verify
+expect_exit 1 "the wrong key exits 1" \
+  --dir "$D3" --key-file "$OTHERKEY" verify
+expect_stderr_match "does not verify under the supplied key" \
+  "and says the MAC failed" --dir "$D3" --key-file "$OTHERKEY" verify
+
+# A key with an unsigned log must be refused: accepting unsigned checkpoints
+# while holding a key would make the key pointless.
+D4="$TMP/unsigned"
+i=0
+while [ "$i" -lt 8 ]; do
+  "$CLI" --dir "$D4" --block-size 4 append "rec-$i" >/dev/null
+  i=$((i + 1))
+done
+expect_exit 1 "an unsigned log with a key exits 1" \
+  --dir "$D4" --key-file "$KEY" verify
+expect_stderr_match "is not signed" "and says so" \
+  --dir "$D4" --key-file "$KEY" verify
+
+# --- the sign command ------------------------------------------------------
+
+expect_exit 0 "sign an existing unsigned log" \
+  --dir "$D4" --key-file "$KEY" sign
+expect_stdout_match "^signed 2 checkpoint" "sign reports the count" \
+  --dir "$D4" --key-file "$KEY" sign
+expect_exit 0 "and it now verifies with the key" \
+  --dir "$D4" --key-file "$KEY" verify
+expect_exit 2 "sign without --key-file is a usage error" --dir "$D4" sign
+
+# The atomic replace must leave no temp file behind.
+checks=$((checks + 1))
+if [ -e "$D4/checkpoints.new" ]; then
+  fail "sign left a checkpoints.new behind"
+fi
+
+# Signing must not change the roots: it re-authenticates, never re-derives.
+checks=$((checks + 1))
+ROOTS_BEFORE="$("$CLI" --dir "$D3" checkpoints)"
+"$CLI" --dir "$D3" --key-file "$KEY" sign >/dev/null
+ROOTS_AFTER="$("$CLI" --dir "$D3" checkpoints)"
+if [ "$ROOTS_BEFORE" != "$ROOTS_AFTER" ]; then
+  fail "sign changed the checkpoint roots"
+fi
+
+# --- key file handling -----------------------------------------------------
+
+expect_exit 2 "a missing key file is a usage error" \
+  --dir "$D3" --key-file "$TMP/nosuchkey" verify
+expect_stderr_match "cannot read key file" "and says so" \
+  --dir "$D3" --key-file "$TMP/nosuchkey" verify
+
+printf 'not hex at all\n' >"$TMP/bad.key"
+chmod 600 "$TMP/bad.key"
+expect_exit 2 "a non-hex key file is a usage error" \
+  --dir "$D3" --key-file "$TMP/bad.key" verify
+expect_stderr_match "openssl rand -hex 32" "and shows how to make one" \
+  --dir "$D3" --key-file "$TMP/bad.key" verify
+
+printf 'abcd\n' >"$TMP/short.key"
+chmod 600 "$TMP/short.key"
+expect_exit 2 "a too-short key is a usage error" \
+  --dir "$D3" --key-file "$TMP/short.key" verify
+expect_stderr_match "at least 16" "and says the minimum" \
+  --dir "$D3" --key-file "$TMP/short.key" verify
+
+printf '' >"$TMP/empty.key"
+chmod 600 "$TMP/empty.key"
+expect_exit 2 "an empty key file is a usage error" \
+  --dir "$D3" --key-file "$TMP/empty.key" verify
+
+# A trailing newline must not change the key: `echo` adds one, and whether it
+# counted would otherwise depend on how the file was created.
+checks=$((checks + 1))
+printf '%s\n' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  >"$TMP/newline.key"
+chmod 600 "$TMP/newline.key"
+if ! "$CLI" --dir "$D3" --key-file "$TMP/newline.key" verify >/dev/null 2>&1; then
+  fail "a trailing newline in the key file changed the key"
+fi
+
+# A group-readable key is a warning, not a refusal: it is the operator's key.
+cp "$KEY" "$TMP/loose.key"
+chmod 644 "$TMP/loose.key"
+expect_exit 0 "a loose-permission key still works" \
+  --dir "$D3" --key-file "$TMP/loose.key" verify
+expect_stderr_match "readable by group or other" "but is warned about" \
+  --dir "$D3" --key-file "$TMP/loose.key" verify
+
 # --- unreadable directory is an I/O error, not a tamper report -------------
 # The distinction the exit codes exist for: "I could not check" must never be
 # reported as "I checked and it is bad".

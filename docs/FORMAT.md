@@ -654,3 +654,107 @@ rescan** rather than an incremental update. Recovery is rare, and having one
 code path that answers "what is the state of this file" is worth more than the
 saved pass — an incremental update here would be a second implementation of the
 same logic, in the one place that is hardest to test.
+
+---
+
+# Anchoring and signed checkpoints (phase 5)
+
+See `docs/THREAT_MODEL.md` for who the attacker is and what each layer catches.
+This section is the format and the mechanics.
+
+## Signed checkpoint frames
+
+`flags` bit 0 (`kCheckpointFlagSigned`) means an HMAC-SHA256 follows the root,
+so the payload is 84 bytes instead of 52 and the frame is 96 instead of 64:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `flags` u32 LE, bit 0 set |
+| 4 | 8 | `first_index` u64 LE |
+| 12 | 8 | `last_index` u64 LE |
+| 20 | 32 | `root` |
+| 52 | 32 | `hmac` |
+
+The MAC covers payload bytes **0..51** — flags, both indexes, and the root. So
+the signed bit is itself authenticated: an attacker cannot clear it and keep a
+valid MAC. They can of course rewrite the checkpoint as unsigned, which is why
+the *requirement* that checkpoints be signed lives with the verifier
+(`verify --key-file`) and not in the file.
+
+The flag and the payload length must agree. A 52-byte payload claiming to be
+signed, or an 84-byte one not flagged, is rejected — otherwise a frame could
+claim a signature with no MAC to check, or hide 32 bytes nothing looks at.
+
+Both sizes coexist in one file, so the offset of the *n*-th checkpoint is no
+longer arithmetic. `read_checkpoints` reports the end offset from its walk.
+
+## HMAC
+
+HMAC-SHA256 (RFC 2104), hand-written on top of the hand-written SHA-256:
+
+```
+K0    = key padded to 64 bytes with zeros, or SHA256(key) padded if longer
+inner = SHA256((K0 ^ 0x36…) || message)
+mac   = SHA256((K0 ^ 0x5c…) || inner)
+```
+
+**Why HMAC rather than `SHA256(key || message)`.** SHA-256 is a
+Merkle–Damgård construction, so from `H(key ‖ m)` and the length of `key ‖ m`
+an attacker can compute `H(key ‖ m ‖ pad ‖ m')` for an `m'` of their choosing,
+*without knowing the key*. That is the length-extension attack, and it is the
+direct consequence of the padding rule described at the top of this document.
+HMAC's two nested hashes under different pads are immune to it.
+
+Keys shorter than 16 bytes are refused. A key file holds **hex**, with
+surrounding whitespace trimmed — raw bytes would mean a file written with
+`echo` silently includes a newline, and whether that newline counted would
+change the key depending on how the file was made.
+
+MAC comparison goes through `digests_equal_constant_time`. Not because a local
+timing attack on a log file is likely, but because the habit is only worth
+having unconditionally — applied selectively, the one place it was skipped is
+the one that mattered.
+
+## Anchors
+
+An anchor is one record's index and hash, written `index:hash`:
+
+```
+11:dacae601b86fef0e12c244aa24e617fc2cafb32a239f521daf88f1a21493c375
+```
+
+`chainlog anchor` prints exactly that form and `--anchor` accepts it verbatim,
+so an anchor can move between machines without reformatting. `--anchor` may be
+given more than once; anchors are sorted by index so the earliest disagreement
+is the one reported.
+
+`verify` checks anchors **after** the chain and the checkpoints, because "your
+log is broken" is a more useful finding than "your log disagrees with a value
+you gave me". Two distinct failures:
+
+- `anchor-missing` — the log has no record at that index. **Truncation**: a
+  prefix of a valid chain is a valid chain, so everything else passed.
+- `anchor-mismatch` — the record exists and hashes to something else.
+  **Rewriting**: the directory agrees with itself and disagrees with the
+  outside world.
+
+`verify` also prints `anchors_checked=` and `signatures_required=` on success,
+because "ok" means a great deal more with a key and an anchor behind it than
+without, and an operator should not have to remember which flags they passed.
+
+## `chainlog sign`
+
+Adds signatures to a log that was not created with a key. It
+**re-authenticates the roots that are already there and does not recompute
+them**, so it cannot be used to launder a tampered log — a stale root stays
+stale and `verify` still reports the mismatch. There is a test for precisely
+that (`sign_refuses_a_damaged_log`, which signs successfully and then confirms
+`verify` still fails).
+
+The replacement is atomic: write `checkpoints.new`, fsync it, `rename(2)` over
+`checkpoints`, fsync the directory. `rename` is atomic within a filesystem, so
+a crash leaves either the old file or the new one and never a mixture — which
+matters here because this rewrites *every* frame, not just the tail, so there
+is no torn-tail story to fall back on. The fsync before the rename is what
+stops a crash leaving the published name pointing at an empty file. Afterwards
+the old descriptor refers to an unlinked inode, so it is reopened.

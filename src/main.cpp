@@ -19,7 +19,10 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
+
 #include "hex.h"
+#include "hmac.h"
 #include "log.h"
 #include "merkle.h"
 
@@ -40,17 +43,26 @@ void usage() {
       "  verify                 recompute the whole chain and every "
       "checkpoint\n"
       "  head                   index and hash of the last record\n"
+      "  anchor                 the head as \"index:hash\", for --anchor\n"
       "  stats                  record count, sizes and block state\n"
       "  checkpoints            list the sealed Merkle roots\n"
       "  prove <index>          inclusion proof for one record\n"
       "  verify-proof <index> <data> <root> <proof>\n"
       "                         check a proof with no access to the log\n"
+      "  sign                   HMAC every existing checkpoint (needs "
+      "--key-file)\n"
       "\n"
       "options:\n"
       "  --dir DIR              log directory (default: $CHAINLOG_DIR, else "
       "./chainlog.d)\n"
       "  --block-size N         records per sealed block, new logs only "
       "(default: %llu)\n"
+      "  --anchor i:hash        verify: require record i to hash to hash.\n"
+      "                         May be given more than once.\n"
+      "  --key-file PATH        HMAC key, as hex. Signs new checkpoints on\n"
+      "                         append; makes verify REQUIRE a valid "
+      "signature\n"
+      "                         on every checkpoint.\n"
       "  --timestamp N          verify-proof: the record's timestamp_ns\n"
       "  --prev-hash HEX        verify-proof: the record's prev_hash\n"
       "\n"
@@ -58,6 +70,16 @@ void usage() {
       "prefix. It also needs --timestamp and --prev-hash, because a leaf\n"
       "commits to the whole record and not just its payload; `prove` prints\n"
       "a ready-made command line with all of them filled in.\n"
+      "\n"
+      "An anchor is a head value kept somewhere the attacker cannot reach.\n"
+      "It is what detects the two things a hash chain cannot see on its own:\n"
+      "a log truncated at a record boundary, and a log rewritten end to end.\n"
+      "Print one with `chainlog anchor`, store it elsewhere, and pass it back\n"
+      "with --anchor.\n"
+      "\n"
+      "Generate a key with:  openssl rand -hex 32 > chainlog.key\n"
+      "Keep it OUTSIDE the log directory -- a key an attacker can read is\n"
+      "a key an attacker can sign with.\n"
       "\n"
       "exit codes: 0 ok, 1 does not verify, 2 usage/IO error\n",
       static_cast<unsigned long long>(chainlog::kDefaultBlockSize));
@@ -134,15 +156,110 @@ int cmd_append(chainlog::Log* log, const std::string& arg) {
   return kExitOk;
 }
 
-int cmd_verify(const chainlog::Log& log) {
+// Reads a hex HMAC key.
+//
+// Hex rather than raw bytes because a key file written with `echo` picks up a
+// trailing newline, and silently keeping or stripping it would make the key
+// depend on how the file happened to be created. Hex with surrounding
+// whitespace trimmed is unambiguous, and `openssl rand -hex 32` produces it.
+bool read_key_file(const std::string& path, std::string* key,
+                   std::string* err) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) {
+    *err = "cannot read key file " + path;
+    return false;
+  }
+  if ((st.st_mode & (S_IRGRP | S_IROTH)) != 0) {
+    // A warning, not a refusal: it is the operator's key and their call. But
+    // a signing key that the group can read is not doing the job it is for.
+    std::fprintf(stderr,
+                 "chainlog: warning: %s is readable by group or other; "
+                 "chmod 600 it\n",
+                 path.c_str());
+  }
+
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr) {
+    *err = "cannot open key file " + path;
+    return false;
+  }
+  std::string text;
+  char buf[1024];
+  while (true) {
+    const size_t n = std::fread(buf, 1, sizeof(buf), f);
+    text.append(buf, n);
+    if (n < sizeof(buf)) {
+      break;
+    }
+  }
+  std::fclose(f);
+
+  // Trim surrounding whitespace, including the newline `echo` adds.
+  const size_t first = text.find_first_not_of(" \t\r\n");
+  const size_t last = text.find_last_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    *err = "key file " + path + " is empty";
+    return false;
+  }
+  text = text.substr(first, last - first + 1);
+
+  std::string detail;
+  if (!chainlog::from_hex(text, key, &detail)) {
+    *err = "key file " + path + " is not hex: " + detail +
+           "\n       generate one with: openssl rand -hex 32 > " + path;
+    return false;
+  }
+  if (key->size() < chainlog::kMinKeyBytes) {
+    *err = "key file " + path + " holds only " + std::to_string(key->size()) +
+           " byte(s); at least " + std::to_string(chainlog::kMinKeyBytes) +
+           " are required";
+    return false;
+  }
+  return true;
+}
+
+int cmd_anchor(const chainlog::Log& log) {
+  chainlog::Record r;
+  if (!log.head(&r)) {
+    std::fprintf(stderr,
+                 "chainlog: the log is empty, so there is nothing to "
+                 "anchor yet\n");
+    return kExitUsage;
+  }
+  // Printed in exactly the form --anchor accepts, so it can be copied
+  // between machines without reformatting.
+  std::printf("%llu:%s\n", static_cast<unsigned long long>(r.index),
+              chainlog::to_hex(r.hash).c_str());
+  return kExitOk;
+}
+
+int cmd_sign(chainlog::Log* log) {
+  std::string err;
+  if (!log->resign_checkpoints(&err)) {
+    std::fprintf(stderr, "chainlog: %s\n", err.c_str());
+    return log->scan_verdict().ok() ? kExitUsage : kExitTamper;
+  }
+  std::printf("signed %llu checkpoint(s)\n",
+              static_cast<unsigned long long>(log->checkpoint_count()));
+  return kExitOk;
+}
+
+int cmd_verify(const chainlog::Log& log,
+               const std::vector<chainlog::Log::Anchor>& anchors) {
   chainlog::Verdict v;
   std::string err;
-  if (!log.verify(&v, &err)) {
+  if (!log.verify(anchors, &v, &err)) {
     std::fprintf(stderr, "chainlog: %s\n", err.c_str());
     return kExitUsage;
   }
   if (v.ok()) {
     std::printf("%s\n", v.message().c_str());
+    // Say what was actually checked. "ok" means much more with a key and an
+    // anchor behind it than without, and an operator should not have to
+    // remember which flags they passed.
+    std::printf("anchors_checked=%llu\n",
+                static_cast<unsigned long long>(anchors.size()));
+    std::printf("signatures_required=%d\n", log.signing() ? 1 : 0);
     if (log.wal_pending()) {
       // Only reachable after a read-only open, which cannot replay. Worth
       // saying out loud: the chain is intact, but one record is staged and
@@ -391,6 +508,8 @@ int main(int argc, char** argv) {
   chainlog::Log::Options opt;
   std::string opt_timestamp;
   std::string opt_prev_hash;
+  std::string opt_key_file;
+  std::vector<std::string> anchor_args;
   std::vector<std::string> positional;
 
   // Options are accepted anywhere, so `prove 5 --dir D` works as well as
@@ -415,6 +534,10 @@ int main(int argc, char** argv) {
       opt_timestamp = argv[++i];
     } else if (arg == "--prev-hash" && i + 1 < argc) {
       opt_prev_hash = argv[++i];
+    } else if (arg == "--anchor" && i + 1 < argc) {
+      anchor_args.push_back(argv[++i]);
+    } else if (arg == "--key-file" && i + 1 < argc) {
+      opt_key_file = argv[++i];
     } else if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-') {
       std::fprintf(stderr, "chainlog: unknown option \"%s\"\n", arg.c_str());
       return kExitUsage;
@@ -448,8 +571,34 @@ int main(int argc, char** argv) {
     return cmd_verify_proof(a);
   }
 
-  chainlog::Log log;
+  // Anchors are parsed before the log is touched, so a typo is reported as a
+  // usage error rather than after a full verification run.
+  std::vector<chainlog::Log::Anchor> anchors;
+  for (size_t a = 0; a < anchor_args.size(); ++a) {
+    chainlog::Log::Anchor parsed;
+    std::string detail;
+    if (!chainlog::parse_anchor(anchor_args[a], &parsed, &detail)) {
+      std::fprintf(stderr, "chainlog: bad --anchor \"%s\": %s\n",
+                   anchor_args[a].c_str(), detail.c_str());
+      return kExitUsage;
+    }
+    anchors.push_back(parsed);
+  }
+
   std::string err;
+  if (!opt_key_file.empty()) {
+    if (!read_key_file(opt_key_file, &opt.key, &err)) {
+      std::fprintf(stderr, "chainlog: %s\n", err.c_str());
+      return kExitUsage;
+    }
+  }
+
+  if (!anchors.empty() && cmd != "verify") {
+    std::fprintf(stderr, "chainlog: --anchor only applies to `verify`\n");
+    return kExitUsage;
+  }
+
+  chainlog::Log log;
   if (!log.open(dir, opt, &err)) {
     std::fprintf(stderr, "chainlog: %s\n", err.c_str());
     return kExitUsage;
@@ -463,7 +612,21 @@ int main(int argc, char** argv) {
     return cmd_append(&log, positional[1]);
   }
   if (cmd == "verify") {
-    return cmd_verify(log);
+    return cmd_verify(log, anchors);
+  }
+  if (cmd == "anchor") {
+    const int rc = cmd_anchor(log);
+    if (rc == kExitOk && !log.scan_verdict().ok()) {
+      return report_damaged(log);
+    }
+    return rc;
+  }
+  if (cmd == "sign") {
+    if (opt_key_file.empty()) {
+      std::fprintf(stderr, "chainlog: `sign` needs --key-file\n");
+      return kExitUsage;
+    }
+    return cmd_sign(&log);
   }
   if (cmd == "checkpoints") {
     return cmd_checkpoints(log);

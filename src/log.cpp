@@ -1,6 +1,9 @@
 #include "log.h"
 
+#include <algorithm>
+
 #include "hex.h"
+#include "hmac.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -17,11 +20,6 @@ namespace {
 // Read size for the sequential scan. Big enough that walking a million frames
 // costs a few thousand syscalls rather than a million.
 constexpr size_t kReadChunk = 256 * 1024;
-
-// Every checkpoint frame is the same size in format version 1, so the offset
-// of the n-th one is exact arithmetic rather than a walk.
-constexpr uint64_t kCheckpointFrameBytes =
-    kCheckpointOverheadBytes + kCheckpointPayloadBytes;
 
 // Cuts a file back to `len`, without a barrier.
 bool truncate_only(int fd, uint64_t len, std::string* err) {
@@ -247,6 +245,7 @@ std::string Log::default_dir() {
 
 bool Log::open(const std::string& dir, const Options& opt, std::string* err) {
   dir_ = dir;
+  key_ = opt.key;
   if (!make_dir_if_missing(dir, err)) {
     return false;
   }
@@ -454,9 +453,12 @@ bool Log::scan_tail(std::string* err) {
 }
 
 bool Log::read_checkpoints(std::vector<Checkpoint>* out, Verdict* v,
-                           std::string* err) const {
+                           std::string* err, uint64_t* end_offset) const {
   out->clear();
   *v = Verdict{};
+  if (end_offset != nullptr) {
+    *end_offset = kCheckpointHeaderBytes;
+  }
 
   uint64_t len = 0;
   if (!file_length(ckpt_fd_.get(), &len, err)) {
@@ -511,6 +513,9 @@ bool Log::read_checkpoints(std::vector<Checkpoint>* out, Verdict* v,
     }
     out->push_back(c);
     off += consumed;
+    if (end_offset != nullptr) {
+      *end_offset = off;
+    }
   }
   return true;
 }
@@ -693,11 +698,14 @@ bool Log::reconcile_checkpoints(std::string* err) {
 
   std::vector<Checkpoint> cps;
   Verdict cv;
-  if (!read_checkpoints(&cps, &cv, err)) {
+  uint64_t end = kCheckpointHeaderBytes;
+  if (!read_checkpoints(&cps, &cv, err, &end)) {
     return false;
   }
   checkpoint_count_ = cps.size();
-  ckpt_end_ = kCheckpointHeaderBytes + cps.size() * kCheckpointFrameBytes;
+  // Taken from the walk, not computed: a signed frame is 32 bytes longer than
+  // an unsigned one, so the n-th offset is no longer arithmetic.
+  ckpt_end_ = end;
 
   if (cv.problem == Problem::kTornCheckpointTail && !read_only_) {
     // A torn trailing frame is a crash artifact in DERIVED data: a checkpoint
@@ -755,6 +763,9 @@ bool Log::seal_pending_block(std::string* err) {
   c.first_index = pending_first_index_;
   c.last_index = pending_first_index_ + pending_hashes_.size() - 1;
   c.root = merkle_root(pending_hashes_);
+  if (!key_.empty()) {
+    sign_checkpoint(key_, &c);
+  }
 
   std::string frame;
   append_checkpoint_frame(c, &frame);
@@ -870,7 +881,8 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   return true;
 }
 
-bool Log::verify(Verdict* out, std::string* err) const {
+bool Log::verify(const std::vector<Anchor>& anchors, Verdict* out,
+                 std::string* err) const {
   Verdict v;
 
   // The WAL is inspected only by open(), because resolving one needs write
@@ -922,6 +934,42 @@ bool Log::verify(Verdict* out, std::string* err) const {
     *out = cv;
     return true;
   }
+
+  // Signature policy, before the walk: a failing MAC is worth reporting
+  // without first hashing the whole log.
+  if (!key_.empty()) {
+    for (size_t i = 0; i < cps.size(); ++i) {
+      if (!cps[i].is_signed()) {
+        v.problem = Problem::kBadCheckpoint;
+        v.index = cps[i].first_index;
+        v.detail = "checkpoint " + std::to_string(i) + " (records " +
+                   std::to_string(cps[i].first_index) + ".." +
+                   std::to_string(cps[i].last_index) +
+                   ") is not signed, but a key was supplied; an attacker with "
+                   "write access can rewrite a checkpoint as unsigned, so "
+                   "unsigned checkpoints are not accepted when a key is in use";
+        *out = v;
+        return true;
+      }
+      if (!checkpoint_signature_valid(key_, cps[i])) {
+        v.problem = Problem::kBadCheckpoint;
+        v.index = cps[i].first_index;
+        v.detail = "checkpoint " + std::to_string(i) +
+                   " has an HMAC that does not verify under the supplied key";
+        *out = v;
+        return true;
+      }
+    }
+  }
+
+  // Anchors sorted by index, so the earliest disagreement is the one
+  // reported, and so the walk can collect them with a single cursor.
+  std::vector<Anchor> wanted = anchors;
+  std::sort(wanted.begin(), wanted.end(),
+            [](const Anchor& a, const Anchor& b) { return a.index < b.index; });
+  std::vector<Digest> anchor_found(wanted.size());
+  std::vector<char> anchor_seen(wanted.size(), 0);
+  size_t anchor_cursor = 0;
 
   const uint64_t bs = h.block_size;
   FrameCursor cur(log_fd_.get(), kHeaderBytes, len);
@@ -987,6 +1035,16 @@ bool Log::verify(Verdict* out, std::string* err) const {
     // investigator at the one record that was not touched.
     prev = computed;
     block.push_back(computed);
+
+    // Collect anchored hashes while the index is still the current record's.
+    // A while loop, not an if: the same index may be anchored twice.
+    while (anchor_cursor < wanted.size() &&
+           wanted[anchor_cursor].index == expected_index) {
+      anchor_found[anchor_cursor] = computed;
+      anchor_seen[anchor_cursor] = 1;
+      ++anchor_cursor;
+    }
+
     ++expected_index;
     ++v.records_verified;
 
@@ -1042,7 +1100,150 @@ bool Log::verify(Verdict* out, std::string* err) const {
                std::to_string(block_no) + " complete block(s)";
   }
 
+  // Anchors last. Both of the holes a hash chain has on its own surface here,
+  // and they surface differently.
+  for (size_t i = 0; i < wanted.size() && v.ok(); ++i) {
+    if (anchor_seen[i] == 0) {
+      // TRUNCATION. A prefix of a valid chain is itself a valid chain, so
+      // everything above passed; the log is simply shorter than it was when
+      // the anchor was taken.
+      v.problem = Problem::kAnchorMissing;
+      v.index = wanted[i].index;
+      v.detail = "the log holds " + std::to_string(v.records_verified) +
+                 " record(s), so there is no record " +
+                 std::to_string(wanted[i].index) +
+                 "; the log is shorter than this anchor says it was";
+      break;
+    }
+    if (!(anchor_found[i] == wanted[i].hash)) {
+      // WHOLESALE REWRITING. The directory agrees with itself and disagrees
+      // with the outside world.
+      v.problem = Problem::kAnchorMismatch;
+      v.index = wanted[i].index;
+      v.detail = "record " + std::to_string(wanted[i].index) +
+                 " hashes to " + to_hex(anchor_found[i]) +
+                 " but this anchor says " + to_hex(wanted[i].hash);
+      break;
+    }
+  }
+
   *out = v;
+  return true;
+}
+
+bool Log::resign_checkpoints(std::string* err) {
+  if (read_only_) {
+    *err = "the log at " + dir_ + " was opened read-only; cannot sign";
+    return false;
+  }
+  if (key_.empty()) {
+    *err = "no key supplied; `sign` needs --key-file";
+    return false;
+  }
+  if (!scan_verdict_.ok()) {
+    *err = "refusing to sign a damaged log: " + scan_verdict_.message();
+    return false;
+  }
+
+  std::vector<Checkpoint> cps;
+  Verdict cv;
+  if (!read_checkpoints(&cps, &cv, err)) {
+    return false;
+  }
+  if (!cv.ok()) {
+    *err = "refusing to sign: the checkpoints file does not check out: " +
+           cv.message();
+    return false;
+  }
+
+  // Signing re-authenticates the roots that are already there; it does not
+  // recompute them. So this cannot be used to launder a tampered log -- a
+  // stale root stays stale, and verify() still catches it.
+  std::string out;
+  CheckpointHeader ch;
+  ch.block_size = header_.block_size;
+  encode_checkpoint_header(ch, &out);
+  for (size_t i = 0; i < cps.size(); ++i) {
+    sign_checkpoint(key_, &cps[i]);
+    append_checkpoint_frame(cps[i], &out);
+  }
+
+  // Atomic replacement. rename(2) is atomic within a filesystem, so a crash
+  // leaves either the old checkpoints file or the new one, never a mixture --
+  // which matters because this rewrites every frame, not just the tail, so
+  // there is no torn-tail story to fall back on.
+  const std::string tmp = checkpoints_path(dir_) + ".new";
+  const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    *err = errno_text("open(" + tmp + ")");
+    return false;
+  }
+  {
+    Fd guard(fd);
+    if (!pwrite_all(fd, out.data(), out.size(), 0, err)) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+    // The new file's contents must be durable BEFORE the rename publishes it,
+    // or a crash could leave the name pointing at an empty file.
+    if (!full_fsync(fd, err)) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+  }
+  if (::rename(tmp.c_str(), checkpoints_path(dir_).c_str()) != 0) {
+    *err = errno_text("rename(" + tmp + ")");
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  // And the rename itself is a directory change, so the directory needs a
+  // barrier too.
+  if (!fsync_dir(dir_, err)) {
+    return false;
+  }
+
+  // The old descriptor now points at the unlinked inode; reopen.
+  ckpt_fd_.reset();
+  if (!open_log_file(checkpoints_path(dir_), false, &ckpt_fd_, &read_only_,
+                     err)) {
+    return false;
+  }
+  uint64_t end = kCheckpointHeaderBytes;
+  std::vector<Checkpoint> reread;
+  if (!read_checkpoints(&reread, &cv, err, &end)) {
+    return false;
+  }
+  checkpoint_count_ = reread.size();
+  ckpt_end_ = end;
+  return true;
+}
+
+bool parse_anchor(const std::string& text, Log::Anchor* out,
+                  std::string* detail) {
+  const size_t colon = text.find(':');
+  if (colon == std::string::npos) {
+    if (detail != nullptr) {
+      *detail = "an anchor is written \"index:hash\" (a decimal index, a "
+                "colon, and 64 hex characters)";
+    }
+    return false;
+  }
+
+  const std::string index_text = text.substr(0, colon);
+  if (index_text.empty() ||
+      index_text.find_first_not_of("0123456789") != std::string::npos) {
+    if (detail != nullptr) {
+      *detail = "\"" + index_text + "\" is not a decimal record index";
+    }
+    return false;
+  }
+
+  Log::Anchor a;
+  a.index = std::strtoull(index_text.c_str(), nullptr, 10);
+  if (!digest_from_hex(text.substr(colon + 1), &a.hash, detail)) {
+    return false;
+  }
+  *out = a;
   return true;
 }
 

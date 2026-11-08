@@ -16,8 +16,8 @@ barely moves a median.
 
 | | |
 |---|---|
-| measured | 2026-11-08 10:35 UTC |
-| commit | `c69c5a4` |
+| measured | 2026-11-08 10:40 UTC |
+| commit | `dd0375b` |
 | CPU | Apple M3 (8 cores) |
 | memory | 8 GiB |
 | arch | arm64 |
@@ -35,7 +35,7 @@ roughly halve throughput; benchmarking that would measure the sanitizer.
 
 | implementation | MB/s (median) | range |
 |---|---|---|
-| ChainLog, hand-written | **345** | 324 – 347 |
+| ChainLog, hand-written | **345** | 330 – 347 |
 | `shasum -a 256` | 413 | |
 | `openssl dgst -sha256` | 2133 | |
 
@@ -52,10 +52,10 @@ purpose is understanding the construction.
 
 | sync policy | appends/s (median) | range | µs each |
 |---|---|---|---|
-| `every` (default, 3 fsyncs) | **146** | 135 – 166 | 6840 |
-| `batch:100` | 15260 | 15133 – 15525 | |
-| `batch:1000` | 32062 | 30880 – 32248 | |
-| `none` | 39461 | 36846 – 40634 | 25.3 |
+| `every` (default, 3 fsyncs) | **164** | 163 – 167 | 6081 |
+| `batch:100` | 15428 | 15358 – 15574 | |
+| `batch:1000` | 29129 | 28177 – 31447 | |
+| `none` | 42017 | 39400 – 42536 | 23.8 |
 
 100-byte records. `every` measured over 500 appends per run
 (it is slow enough that more would add minutes); the others over
@@ -65,13 +65,13 @@ yet.
 
 **What this is actually measuring.** The default policy issues three
 `fcntl(F_FULLFSYNC)` calls per append -- one for the write-ahead log, one
-for the main log, one after clearing the WAL. At 6840 µs
-per append that is roughly 2.3 ms
+for the main log, one after clearing the WAL. At 6081 µs
+per append that is roughly 2.0 ms
 per barrier, which is the drive being asked to flush its own write cache.
 Plain `fsync()` on APFS does not do that, which is why this project uses
 `F_FULLFSYNC` and why the number looks the way it does.
 
-Peak RSS for an append run: **1.7 MiB**, independent of
+Peak RSS for an append run: **1.8 MiB**, independent of
 record count -- appending is O(1) in memory apart from the pending
 block's hashes.
 
@@ -79,8 +79,8 @@ block's hashes.
 
 | records | log size | open (s) | verify (s) | range | records/s | MB/s | peak RSS |
 |---|---|---|---|---|---|---|---|
-| 100000 | 19.1 MiB | 0.0518 | **0.1654** | 0.1653 – 0.1694 | 604510 | 115 | 2.3 MiB |
-| 1000000 | 190.7 MiB | 0.5160 | **1.67** | 1.66 – 1.71 | 597814 | 114 | 2.3 MiB |
+| 100000 | 19.1 MiB | 0.0522 | **0.1664** | 0.1651 – 0.1706 | 601108 | 115 | 2.3 MiB |
+| 1000000 | 190.7 MiB | 0.5275 | **1.72** | 1.67 – 1.74 | 582743 | 111 | 2.3 MiB |
 
 `open` and `verify` are separated because they do different work.
 `open` walks every frame checking the magic, the lengths and the CRC-32
@@ -94,16 +94,16 @@ records or a million. That is the one design decision in the project that
 shows up directly as a measured number.
 
 The 1000000-record corpus was built with `--sync none` in
-25.4 s. At the default policy it would have taken about
-114 minutes,
+25.0 s. At the default policy it would have taken about
+101 minutes,
 which is itself a useful illustration of what the barriers cost.
 
 ## Merkle trees and proofs
 
 | leaves | levels | build (s) | proof steps | proof on the wire | proof+verify (µs) |
 |---|---|---|---|---|---|
-| 1024 | | 0.0012 | 10 | 360 B | **7.44** |
-| 1048576 | 21 | 0.6169 | 20 | 690 B | **8.81** |
+| 1024 | 11 | 0.0012 | 10 | 360 B | **7.36** |
+| 1048576 | 21 | 0.6328 | 20 | 690 B | **8.87** |
 
 1024 leaves is the real case: it is the default block size, so it is the
 tree an inclusion proof is actually built over. 1048576 leaves is

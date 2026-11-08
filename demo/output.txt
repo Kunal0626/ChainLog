@@ -1,0 +1,216 @@
+ChainLog tamper demo
+--------------------------------------------------------------------------------
+machine:  arm64 Darwin 26.6.2
+binary:   build/release/chainlog
+records:  1000
+block:    128 records per sealed Merkle checkpoint
+--------------------------------------------------------------------------------
+
+Record data is fixed width ("rec-000637"), so every frame is the same
+size and the attacks below can swap or rewrite frames without shifting
+any offsets. Hashes differ from run to run because each record's
+timestamp is part of what it hashes.
+
+$ for i in $(seq 0 999); do chainlog --dir demo/work/pristine --block-size 128 append "rec-$i"; done
+| (built in 11s)
+
+$ chainlog --dir demo/work/pristine stats
+| records=1000
+| log_bytes=110032
+| data_bytes=10000
+| block_size=128
+| sealed_blocks=7
+| checkpoints=7
+| pending_records=104
+| wal_pending=0
+| read_only=0
+| locked=1
+
+$ chainlog --dir demo/work/pristine verify
+| ok: 1000 record(s) verified
+| anchors_checked=0
+| signatures_required=0
+
+$ chainlog --dir demo/work/pristine anchor
+| 999:248c379f6a6f1471b6ed80fbf26d55c62dc540372323869f561c738602f8528c
+
+That anchor is the one thing we now keep OUTSIDE the log directory. Cases
+(d2) and (f) below are invisible without it.
+
+================================================================================
+(a) one byte flipped in record 637
+================================================================================
+
+$ demo/attacker.py flip demo/work/a 637
+| flipped one bit in record 637's data (byte offset 70134); the frame CRC was left alone
+
+$ chainlog --dir demo/work/a verify
+| chainlog: verification FAILED: bad-crc at index 637 (byte offset 70102): crc32 stored 69d27ba6, computed ec4f3297
+| chainlog: 637 record(s) verified before the failure
+| exit status 1
+
+  => caught by the frame CRC-32, and it names record 637 exactly
+
+================================================================================
+(b) record 500 deleted outright
+================================================================================
+
+$ demo/attacker.py delete demo/work/b 500
+| deleted record 500's whole frame (110 bytes at offset 55032)
+
+$ chainlog --dir demo/work/b verify
+| chainlog: verification FAILED: bad-index at index 500 (byte offset 55032): expected index 500, frame says 501
+| chainlog: 500 record(s) verified before the failure
+| exit status 1
+
+  => caught by the index sequence: record 501 is sitting where 500 should be
+
+================================================================================
+(c) records 300 and 301 exchanged
+================================================================================
+
+$ demo/attacker.py swap demo/work/c 300 301
+| exchanged the frames of records 300 and 301
+
+$ chainlog --dir demo/work/c verify
+| chainlog: verification FAILED: bad-index at index 300 (byte offset 33032): expected index 300, frame says 301
+| chainlog: 300 record(s) verified before the failure
+| exit status 1
+
+  => caught by the index sequence before the hashes are even consulted
+
+================================================================================
+(d1) the tail cut off part-way through the last frame
+================================================================================
+
+$ demo/attacker.py truncate-mid demo/work/d1 40
+| cut 40 bytes off the end of the log (110032 -> 109992), part-way through the last frame
+
+$ chainlog --dir demo/work/d1 verify
+| chainlog: verification FAILED: torn-tail at index 999 (byte offset 109922): frame claims 110 bytes, only 70 left at end of file
+| chainlog: 999 record(s) verified before the failure
+| exit status 1
+
+  => caught by the framing, and reported as a torn tail -- the signature of a crash, not an edit
+
+================================================================================
+(d2) the tail cut off cleanly, at a frame boundary
+================================================================================
+
+$ demo/attacker.py truncate demo/work/d2 768
+| cut the log from 1000 records to 768, at a frame boundary, and trimmed the checkpoints to 6
+
+$ chainlog --dir demo/work/d2 verify
+| ok: 768 record(s) verified
+| anchors_checked=0
+| signatures_required=0
+| exit status 0
+
+  => NOT caught. A prefix of a valid chain is itself a valid chain, so nothing inside the directory disagrees.
+
+$ chainlog --dir demo/work/d2 verify --anchor 999:248c379f6a6f1471b6ed80fbf26d55c62dc540372323869f561c738602f8528c
+| chainlog: verification FAILED: anchor-missing at index 999 (byte offset 0): the log holds 768 record(s), so there is no record 999; the log is shorter than this anchor says it was
+| chainlog: 768 record(s) verified before the failure
+| exit status 1
+
+  => caught by the anchor: the log is shorter than the head we published
+
+================================================================================
+(e) record 637 rewritten and every record after it re-linked
+================================================================================
+
+$ demo/attacker.py relink demo/work/e 637
+| rewrote record 637 and re-linked every record after it; the chain is now internally consistent
+
+$ chainlog --dir demo/work/e verify
+| chainlog: verification FAILED: bad-checkpoint at index 512 (byte offset 0): block 4 (records 512..639) has root d4976aaa17ea771754ba9026872512a70d7aead79e71d97cb36c1f050882b3b8 but the checkpoint says 5cc09c059b2dce907e44fee3bc3d5bc5b20ae48bb334c19c5b9b9d9cd46bbfa1
+| chainlog: 640 record(s) verified before the failure
+| exit status 1
+
+  => caught by the sealed Merkle roots, which still remember the original history
+
+================================================================================
+(f) ... and the checkpoints re-sealed to match
+================================================================================
+
+$ demo/attacker.py relink demo/work/f 637
+| rewrote record 637 and re-linked every record after it; the chain is now internally consistent
+
+$ demo/attacker.py reseal demo/work/f
+| recomputed 7 checkpoint root(s) (unsigned: no key)
+
+$ chainlog --dir demo/work/f verify
+| ok: 1000 record(s) verified
+| anchors_checked=0
+| signatures_required=0
+| exit status 0
+
+  => NOT caught. Every part of the directory now agrees with every other part, because the attacker controlled all of it.
+
+$ chainlog --dir demo/work/f verify --anchor 999:248c379f6a6f1471b6ed80fbf26d55c62dc540372323869f561c738602f8528c
+| chainlog: verification FAILED: anchor-mismatch at index 999 (byte offset 0): record 999 hashes to 3f56c3c47d65be74e22e7ce936ca522a823cb8bd02984fd28dece9d319fbd2ee but this anchor says 248c379f6a6f1471b6ed80fbf26d55c62dc540372323869f561c738602f8528c
+| chainlog: 1000 record(s) verified before the failure
+| exit status 1
+
+  => caught by the anchor, the one value the attacker never had access to
+
+================================================================================
+(g) the same attack on a log whose checkpoints are HMAC-signed
+================================================================================
+
+$ for i in $(seq 0 255); do chainlog --dir demo/work/g --block-size 128 --key-file KEY append "rec-$i"; done
+| 256 records, 2 signed checkpoints
+
+$ demo/attacker.py relink demo/work/g 100
+| rewrote record 100 and re-linked every record after it; the chain is now internally consistent
+
+$ demo/attacker.py reseal demo/work/g
+| recomputed 2 checkpoint root(s) (unsigned: no key)
+
+$ chainlog --dir demo/work/g verify
+| ok: 256 record(s) verified
+| anchors_checked=0
+| signatures_required=0
+| exit status 0
+
+  => still not caught WITHOUT the key -- the attacker re-sealed valid unsigned checkpoints
+
+$ chainlog --dir demo/work/g --key-file KEY verify
+| chainlog: verification FAILED: bad-checkpoint at index 0 (byte offset 0): checkpoint 0 (records 0..127) is not signed, but a key was supplied; an attacker with write access can rewrite a checkpoint as unsigned, so unsigned checkpoints are not accepted when a key is in use
+| chainlog: 0 record(s) verified before the failure
+| exit status 1
+
+  => caught by the key alone, no anchor needed: the attacker could not sign what they wrote
+
+================================================================================
+Summary
+================================================================================
+
+  case                                    verify alone   with an anchor
+  ------------------------------------------------------------------------
+  (a) one byte flipped                    bad-crc        -
+  (b) a record deleted                    bad-index      -
+  (c) two records swapped                 bad-index      -
+  (d1) tail cut mid-frame                 torn-tail      -
+  (d2) tail cut at a frame boundary       OK (!)         anchor-missing
+  (e) tail re-linked                      bad-checkpoint -
+  (f) re-linked and re-sealed             OK (!)         anchor-mismatch
+  (g) (f) against a signed log            OK (!)         bad-checkpoint, with --key-file
+
+The three OK(!) rows are the point of the demo, and they are two
+different kinds of blindness.
+
+(d2) is MISSING data. A prefix of a valid chain is itself a valid chain,
+so a log that has had its tail cut off verifies perfectly. Nothing inside
+the file records how long it was supposed to be.
+
+(f) and (g) are REWRITTEN data. Every check up to that point compares one
+part of the directory against another part -- and an attacker with write
+access controls both sides of that comparison.
+
+Both are closed the same way: by one value the attacker never touched.
+An anchor closes both. A signing key closes the rewriting only, because
+nothing it signs says how many checkpoints there should be.
+
+11 case(s) asserted, 0 failure(s)
+demo: OK

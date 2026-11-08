@@ -10,3 +10,4 @@ a.out
 chainlog.d/
 *.chainlog.d/
 bench/tmp/
+demo/work/

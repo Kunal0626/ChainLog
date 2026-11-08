@@ -80,6 +80,26 @@ fresh_log() {
   done
 }
 
+# flip_byte <file> <offset>
+#
+# XORs one byte, so its value is GUARANTEED to change. Overwriting with a
+# fixed value instead is a no-op whenever the byte already holds that value --
+# and since record content includes timestamps, the content differs every run,
+# so such a test silently does nothing about one run in 256.
+flip_byte() {
+  python3 -I -c '
+import sys
+path, off = sys.argv[1], int(sys.argv[2])
+with open(path, "r+b") as f:
+    f.seek(off)
+    b = f.read(1)
+    if not b:
+        sys.exit("flip_byte: offset %d is past the end of %s" % (off, path))
+    f.seek(off)
+    f.write(bytes([b[0] ^ 0x80]))
+' "$1" "$2"
+}
+
 echo "oracle-format: checking the C++ writer against docs/FORMAT.md"
 
 # --- 1. a clean log of varied records --------------------------------------
@@ -175,7 +195,7 @@ done
 # flip one byte inside a record -> bad-crc
 D="$TMP/badcrc"
 fresh_log "$D" 10
-printf '\xaa' | dd of="$D/log" bs=1 seek=200 count=1 conv=notrunc status=none
+flip_byte "$D/log" 200
 run_parser "python missed a flipped byte" "$D" --expect-problem bad-crc
 checks=$((checks + 1))
 if "$CLI" --dir "$D" verify >/dev/null 2>&1; then
@@ -212,8 +232,7 @@ D="$TMP/badroot"
 fresh_log "$D" 16 --block-size 8
 # The root sits at offset 20 inside the second checkpoint's payload.
 CKPT_FRAME=$((12 + 52))
-printf '\x5a' | dd of="$D/checkpoints" bs=1 \
-  seek=$((32 + CKPT_FRAME + 8 + 20)) count=1 conv=notrunc status=none
+flip_byte "$D/checkpoints" $((32 + CKPT_FRAME + 8 + 20))
 run_parser "python missed an edited root" "$D" --expect-problem bad-checkpoint
 checks=$((checks + 1))
 if "$CLI" --dir "$D" verify >/dev/null 2>&1; then

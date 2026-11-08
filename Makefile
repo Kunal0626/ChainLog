@@ -53,7 +53,7 @@ TESTBIN   = $(TST_DIR)/chainlog-tests
 TST_CLI_OBJS = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(CLI_SRCS:%.cpp=$(TST_DIR)/%.o)
 CHAINLOG_ASAN = $(TST_DIR)/chainlog
 
-.PHONY: all test unit oracle cli crash clean
+.PHONY: all test unit oracle cli crash demo demo-capture clean
 all: $(CHAINLOG) $(CL_SHA256) $(CL_CRC32) $(CL_HMAC)
 
 # --- compile rules ---------------------------------------------------------
@@ -117,7 +117,22 @@ cli: $(CHAINLOG_ASAN)
 crash: $(CHAINLOG)
 	tests/crash.sh $(CHAINLOG)
 
-test: unit oracle cli crash
+# The tamper demo. Every case asserts its expected verdict, so this is a test
+# as well as a demonstration -- a demo that merely prints whatever happens is
+# one that can quietly stop demonstrating anything.
+demo: $(CHAINLOG)
+	demo/tamper.sh $(CHAINLOG)
+
+# Same, but records the transcript in demo/output.txt for the README. Kept
+# separate from `demo` so that running the test suite does not leave a
+# modified file in the working tree.
+demo-capture: $(CHAINLOG)
+	demo/tamper.sh $(CHAINLOG) > demo/output.txt.tmp 2>&1; \
+	  status=$$?; cat demo/output.txt.tmp; \
+	  if [ $$status -eq 0 ]; then mv demo/output.txt.tmp demo/output.txt; \
+	  else rm -f demo/output.txt.tmp; exit $$status; fi
+
+test: unit oracle cli crash demo
 
 clean:
 	rm -rf $(BUILD)

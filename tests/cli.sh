@@ -78,6 +78,27 @@ expect_stderr_match() {
   fi
 }
 
+# flip_byte <file> <offset>
+#
+# XORs one byte, so its value is GUARANTEED to change. Overwriting with a
+# fixed value instead (printf '\xff' | dd ...) is a no-op whenever the byte
+# already holds that value -- and since record content includes timestamps,
+# the content differs every run, so such a test silently does nothing about
+# one run in 256. That is worse than no test.
+flip_byte() {
+  python3 -I -c '
+import sys
+path, off = sys.argv[1], int(sys.argv[2])
+with open(path, "r+b") as f:
+    f.seek(off)
+    b = f.read(1)
+    if not b:
+        sys.exit("flip_byte: offset %d is past the end of %s" % (off, path))
+    f.seek(off)
+    f.write(bytes([b[0] ^ 0x80]))
+' "$1" "$2"
+}
+
 echo "cli: testing $CLI"
 
 HEX64='[0-9a-f]{64}'
@@ -174,8 +195,7 @@ expect_exit 0 "ten records verify before tampering" --dir "$D" verify
 
 # Flip one byte well past the header, inside a record.
 checks=$((checks + 1))
-if ! printf '\xff' | dd of="$D/log" bs=1 seek=200 count=1 conv=notrunc \
-     status=none 2>/dev/null; then
+if ! flip_byte "$D/log" 200; then
   fail "could not flip a byte in the log"
 fi
 

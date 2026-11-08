@@ -22,11 +22,36 @@ namespace chainlog {
 
 class Log {
  public:
+  // When the fsync barriers in the append protocol actually happen.
+  //
+  // Only kEveryAppend gives the guarantee the WAL exists for. The other two
+  // are for bulk import and for benchmarking, and they are genuinely unsafe:
+  // see the comment on Options::sync.
+  enum class SyncPolicy {
+    kEveryAppend,  // three barriers per append; the default
+    kBatched,      // barriers every Options::sync_batch appends
+    kNone,         // no barriers except an explicit flush()
+  };
+
   struct Options {
     // Records per sealed Merkle block. Only used when creating a new log; for
     // an existing one the value in the file header wins, because the stored
     // checkpoints are only meaningful relative to it.
     uint64_t block_size = kDefaultBlockSize;
+
+    // How often to fsync. kEveryAppend is the default and the only policy
+    // under which an append that returned success is guaranteed to survive
+    // power loss.
+    //
+    // Under kBatched and kNone the WAL is still written and cleared, so the
+    // code path and the on-disk format are identical -- but with the barriers
+    // skipped the WAL provides NO crash guarantee. A crash can then leave a
+    // torn frame at the tail with an empty WAL, which verify() reports as
+    // torn-tail and which this build does not repair automatically (see
+    // "Limitations" in the README). These policies exist because bulk import
+    // and benchmarking are real needs, not because durability is optional.
+    SyncPolicy sync = SyncPolicy::kEveryAppend;
+    uint64_t sync_batch = 1000;
 
     // HMAC key for signing checkpoints. Empty means unsigned.
     //
@@ -143,6 +168,11 @@ class Log {
   bool verify(const std::vector<Anchor>& anchors, Verdict* out,
               std::string* err) const;
 
+  // Forces a barrier on every file, whatever the sync policy. Callers using
+  // kBatched or kNone must call this before treating anything as durable;
+  // close() does NOT, because it cannot report an error.
+  bool flush(std::string* err);
+
   // Copies the last record into *out. Returns false if the log is empty.
   // O(1): the tail record is cached by open() and append().
   bool head(Record* out) const;
@@ -232,6 +262,9 @@ class Log {
   Header header_;
 
   std::string key_;
+  SyncPolicy sync_ = SyncPolicy::kEveryAppend;
+  uint64_t sync_batch_ = 1000;
+  uint64_t appends_since_sync_ = 0;
   bool read_only_ = false;
   bool locked_ = false;
   bool wal_pending_ = false;

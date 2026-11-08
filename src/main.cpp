@@ -21,6 +21,8 @@
 
 #include <sys/stat.h>
 
+#include <iostream>
+
 #include "hex.h"
 #include "hmac.h"
 #include "log.h"
@@ -40,6 +42,7 @@ void usage() {
       "commands:\n"
       "  append <data>          append a record containing <data>\n"
       "  append -               append a record containing all of stdin\n"
+      "  import                 append one record per line of stdin\n"
       "  verify                 recompute the whole chain and every "
       "checkpoint\n"
       "  head                   index and hash of the last record\n"
@@ -59,6 +62,9 @@ void usage() {
       "(default: %llu)\n"
       "  --anchor i:hash        verify: require record i to hash to hash.\n"
       "                         May be given more than once.\n"
+      "  --sync MODE            every (default), batch:N, or none.\n"
+      "                         Anything but `every` trades durability for\n"
+      "                         speed; see below.\n"
       "  --key-file PATH        HMAC key, as hex. Signs new checkpoints on\n"
       "                         append; makes verify REQUIRE a valid "
       "signature\n"
@@ -76,6 +82,13 @@ void usage() {
       "a log truncated at a record boundary, and a log rewritten end to end.\n"
       "Print one with `chainlog anchor`, store it elsewhere, and pass it back\n"
       "with --anchor.\n"
+      "\n"
+      "--sync every fsyncs at all three steps of the append protocol, and is\n"
+      "the only mode in which an append that succeeded is guaranteed to\n"
+      "survive power loss. batch:N and none skip those barriers: a crash can\n"
+      "then lose records and leave a torn tail that this build does not repair\n"
+      "automatically. They are for bulk import (`import` defaults to\n"
+      "batch:1000 and always flushes when it finishes) and for benchmarking.\n"
       "\n"
       "Generate a key with:  openssl rand -hex 32 > chainlog.key\n"
       "Keep it OUTSIDE the log directory -- a key an attacker can read is\n"
@@ -241,6 +254,47 @@ int cmd_sign(chainlog::Log* log) {
   }
   std::printf("signed %llu checkpoint(s)\n",
               static_cast<unsigned long long>(log->checkpoint_count()));
+  return kExitOk;
+}
+
+// Appends one record per line of stdin. Batched by default, because the whole
+// point of a bulk import is to amortise the barriers -- and it flushes before
+// returning, so an import that reports success is durable.
+int cmd_import(chainlog::Log* log) {
+  std::string err;
+  std::string line;
+  uint64_t count = 0;
+  chainlog::Record r;
+
+  while (std::getline(std::cin, line)) {
+    if (!log->append(line, &r, &err)) {
+      std::fprintf(stderr, "chainlog: at line %llu: %s\n",
+                   static_cast<unsigned long long>(count + 1), err.c_str());
+      // Flush what did land, so a failed import leaves a durable prefix
+      // rather than an indeterminate amount of unsynced data.
+      std::string flush_err;
+      log->flush(&flush_err);
+      return log->scan_verdict().ok() ? kExitUsage : kExitTamper;
+    }
+    ++count;
+  }
+  if (std::cin.bad()) {
+    std::fprintf(stderr, "chainlog: read error on stdin\n");
+    std::string flush_err;
+    log->flush(&flush_err);
+    return kExitUsage;
+  }
+
+  if (!log->flush(&err)) {
+    std::fprintf(stderr, "chainlog: %s\n", err.c_str());
+    return kExitUsage;
+  }
+  std::printf("imported=%llu\n", static_cast<unsigned long long>(count));
+  if (count > 0) {
+    std::printf("index=%llu hash=%s\n",
+                static_cast<unsigned long long>(r.index),
+                chainlog::to_hex(r.hash).c_str());
+  }
   return kExitOk;
 }
 
@@ -509,6 +563,7 @@ int main(int argc, char** argv) {
   std::string opt_timestamp;
   std::string opt_prev_hash;
   std::string opt_key_file;
+  std::string opt_sync;
   std::vector<std::string> anchor_args;
   std::vector<std::string> positional;
 
@@ -538,6 +593,8 @@ int main(int argc, char** argv) {
       anchor_args.push_back(argv[++i]);
     } else if (arg == "--key-file" && i + 1 < argc) {
       opt_key_file = argv[++i];
+    } else if (arg == "--sync" && i + 1 < argc) {
+      opt_sync = argv[++i];
     } else if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-') {
       std::fprintf(stderr, "chainlog: unknown option \"%s\"\n", arg.c_str());
       return kExitUsage;
@@ -551,6 +608,46 @@ int main(int argc, char** argv) {
     return kExitUsage;
   }
   const std::string cmd = positional[0];
+
+  // `import` defaults to batching, because amortising the barriers is the
+  // entire reason to have a bulk path. Everything else defaults to the safe
+  // policy.
+  if (cmd == "import" && opt_sync.empty()) {
+    opt_sync = "batch:1000";
+  }
+  if (!opt_sync.empty()) {
+    if (opt_sync == "every") {
+      opt.sync = chainlog::Log::SyncPolicy::kEveryAppend;
+    } else if (opt_sync == "none") {
+      opt.sync = chainlog::Log::SyncPolicy::kNone;
+    } else if (opt_sync.compare(0, 6, "batch:") == 0) {
+      const long long n = std::atoll(opt_sync.c_str() + 6);
+      if (n <= 0) {
+        std::fprintf(stderr, "chainlog: --sync batch:N needs N > 0\n");
+        return kExitUsage;
+      }
+      opt.sync = chainlog::Log::SyncPolicy::kBatched;
+      opt.sync_batch = static_cast<uint64_t>(n);
+    } else {
+      std::fprintf(stderr,
+                   "chainlog: --sync must be every, batch:N or none, "
+                   "not \"%s\"\n",
+                   opt_sync.c_str());
+      return kExitUsage;
+    }
+
+    // A single `append` exits immediately after writing, so a skipped barrier
+    // means the record may simply not be there after a power cut. Said out
+    // loud rather than hidden behind a silent flush, which would make the
+    // option a lie.
+    if (opt.sync != chainlog::Log::SyncPolicy::kEveryAppend &&
+        cmd == "append") {
+      std::fprintf(stderr,
+                   "chainlog: warning: --sync %s skips the fsync barriers, so "
+                   "this record is NOT guaranteed to survive power loss\n",
+                   opt_sync.c_str());
+    }
+  }
 
   // verify-proof never touches the log, so it must work with no log directory
   // present at all -- that is the entire point of a standalone verifier.
@@ -610,6 +707,9 @@ int main(int argc, char** argv) {
       return kExitUsage;
     }
     return cmd_append(&log, positional[1]);
+  }
+  if (cmd == "import") {
+    return cmd_import(&log);
   }
   if (cmd == "verify") {
     return cmd_verify(log, anchors);

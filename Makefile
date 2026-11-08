@@ -42,6 +42,12 @@ REL_CLI_OBJS  = $(CLI_SRCS:%.cpp=$(REL_DIR)/%.o)
 REL_TOOL_OBJS = $(TOOL_SRCS:%.cpp=$(REL_DIR)/%.o)
 TST_OBJS      = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(TEST_SRCS:%.cpp=$(TST_DIR)/%.o)
 
+BENCH_SRCS = bench/bench_util.cpp
+BENCH_MAIN = bench/bench_append.cpp bench/bench_verify.cpp \
+             bench/bench_merkle.cpp bench/bench_sha256.cpp bench/bench_mem.cpp
+REL_BENCH_OBJS = $(BENCH_SRCS:%.cpp=$(REL_DIR)/%.o)
+BENCHES = $(patsubst bench/%.cpp,$(REL_DIR)/%,$(BENCH_MAIN))
+
 CHAINLOG  = $(REL_DIR)/chainlog
 CL_SHA256 = $(REL_DIR)/cl-sha256
 CL_CRC32  = $(REL_DIR)/cl-crc32
@@ -53,7 +59,7 @@ TESTBIN   = $(TST_DIR)/chainlog-tests
 TST_CLI_OBJS = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(CLI_SRCS:%.cpp=$(TST_DIR)/%.o)
 CHAINLOG_ASAN = $(TST_DIR)/chainlog
 
-.PHONY: all test unit oracle cli crash demo demo-capture clean
+.PHONY: all test unit oracle cli crash demo demo-capture bench bench-build clean
 all: $(CHAINLOG) $(CL_SHA256) $(CL_CRC32) $(CL_HMAC)
 
 # --- compile rules ---------------------------------------------------------
@@ -69,6 +75,22 @@ $(TST_DIR)/%.o: %.cpp
 	$(CXX) $(TST_FLAGS) -MMD -MP -c $< -o $@
 
 # --- link rules ------------------------------------------------------------
+
+# Benchmarks are release-only and get -Ibench for bench_util.h. Never built
+# with sanitizers: ASan roughly halves throughput, which would make every
+# number in RESULTS.md a measurement of the sanitizer.
+$(REL_DIR)/bench/%.o: bench/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(REL_FLAGS) -Ibench -MMD -MP -c $< -o $@
+
+$(REL_DIR)/bench_%: $(REL_DIR)/bench/bench_%.o $(REL_BENCH_OBJS) $(REL_LIB_OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(REL_FLAGS) $< $(REL_BENCH_OBJS) $(REL_LIB_OBJS) -o $@
+
+bench-build: $(BENCHES)
+
+bench: $(BENCHES) $(CHAINLOG)
+	bench/run.sh
 
 $(CHAINLOG): $(REL_LIB_OBJS) $(REL_CLI_OBJS)
 	@mkdir -p $(dir $@)
@@ -137,5 +159,6 @@ test: unit oracle cli crash demo
 clean:
 	rm -rf $(BUILD)
 
--include $(REL_LIB_OBJS:.o=.d) $(REL_CLI_OBJS:.o=.d) $(REL_TOOL_OBJS:.o=.d) \
+-include $(REL_BENCH_OBJS:.o=.d) $(BENCH_MAIN:bench/%.cpp=$(REL_DIR)/bench/%.d) \
+         $(REL_LIB_OBJS:.o=.d) $(REL_CLI_OBJS:.o=.d) $(REL_TOOL_OBJS:.o=.d) \
          $(TST_OBJS:.o=.d) $(TST_CLI_OBJS:.o=.d)

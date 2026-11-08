@@ -246,6 +246,8 @@ std::string Log::default_dir() {
 bool Log::open(const std::string& dir, const Options& opt, std::string* err) {
   dir_ = dir;
   key_ = opt.key;
+  sync_ = opt.sync;
+  sync_batch_ = (opt.sync_batch == 0) ? 1 : opt.sync_batch;
   if (!make_dir_if_missing(dir, err)) {
     return false;
   }
@@ -772,7 +774,7 @@ bool Log::seal_pending_block(std::string* err) {
   if (!pwrite_all(ckpt_fd_.get(), frame.data(), frame.size(), ckpt_end_, err)) {
     return false;
   }
-  if (!full_fsync(ckpt_fd_.get(), err)) {
+  if (sync_ == SyncPolicy::kEveryAppend && !full_fsync(ckpt_fd_.get(), err)) {
     return false;
   }
   ckpt_end_ += frame.size();
@@ -826,7 +828,7 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   if (!truncate_only(wal_fd_.get(), kWalHeaderBytes + frame.size(), err)) {
     return false;
   }
-  if (!full_fsync(wal_fd_.get(), err)) {
+  if (sync_ == SyncPolicy::kEveryAppend && !full_fsync(wal_fd_.get(), err)) {
     return false;
   }
   crash_if_configured(CrashPoint::kAfterWalWrite);
@@ -835,7 +837,7 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   if (!pwrite_all(log_fd_.get(), frame.data(), frame.size(), log_end_, err)) {
     return false;
   }
-  if (!full_fsync(log_fd_.get(), err)) {
+  if (sync_ == SyncPolicy::kEveryAppend && !full_fsync(log_fd_.get(), err)) {
     return false;
   }
   crash_if_configured(CrashPoint::kAfterMainWrite);
@@ -873,11 +875,45 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   crash_if_configured(CrashPoint::kBeforeWalTruncate);
 
   // --- step 3: the staged copy has served its purpose ---------------------
-  if (!truncate_to(wal_fd_.get(), kWalHeaderBytes, err)) {
+  if (!truncate_only(wal_fd_.get(), kWalHeaderBytes, err)) {
+    return false;
+  }
+  if (sync_ == SyncPolicy::kEveryAppend && !full_fsync(wal_fd_.get(), err)) {
     return false;
   }
 
+  // Batched policies get their barrier here instead, covering every append
+  // since the last one. Note what this costs: the WAL above was written and
+  // cleared without a barrier, so it cannot answer "was this record
+  // acknowledged?" after a crash. That is the trade being measured in
+  // bench/.
+  ++appends_since_sync_;
+  if (sync_ == SyncPolicy::kBatched && appends_since_sync_ >= sync_batch_) {
+    if (!flush(err)) {
+      return false;
+    }
+  }
+
   *out = r;
+  return true;
+}
+
+bool Log::flush(std::string* err) {
+  if (read_only_) {
+    return true;  // Nothing was written, so nothing needs a barrier.
+  }
+  // The log before the WAL: the log is the durable history, and the WAL's
+  // whole job is to be ahead of it, never behind.
+  if (log_fd_.valid() && !full_fsync(log_fd_.get(), err)) {
+    return false;
+  }
+  if (ckpt_fd_.valid() && !full_fsync(ckpt_fd_.get(), err)) {
+    return false;
+  }
+  if (wal_fd_.valid() && !full_fsync(wal_fd_.get(), err)) {
+    return false;
+  }
+  appends_since_sync_ = 0;
   return true;
 }
 
